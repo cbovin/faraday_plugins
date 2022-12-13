@@ -52,7 +52,6 @@ class OpenScapOvalHTMLParser:
                     else:
                         vulns.append({
                             'ip': ip,
-                            # 'os': 'Ubuntu 20.04 LTS',
                             'name': cve,
                             'description': '',
                             'severity': 'unclassified',
