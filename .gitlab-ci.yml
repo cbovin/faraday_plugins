@@ -1,0 +1,116 @@
+variables:
+    VAULT_ROLE: 'python-sast-readonly'
+    VAULT_ADDR: 'https://tluav-lb.faradaysec.com'
+    VAULT_SECRET_PATH: 'gitlab/SAST'
+
+
+include:
+  - local: .gitlab/ci/fetch-secrets.yml
+
+stages:
+  - SAST
+  - pre_testing
+  - testing
+  - post_testing
+  - publish
+
+before_script:
+  - apt-get update -qy
+  - pip install pip -U
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+    - when: always
+
+.install_faraday_venv: &install_faraday_venv
+- pip3 install virtualenv
+- virtualenv -p python3 faraday_venv
+- source faraday_venv/bin/activate
+- pip3 install pytest pytest-xdist pytest-cov
+- git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/faradaysec/faraday.git
+- cd faraday
+- pip3 install $PIP_FLAGS .
+- pip uninstall faraday-plugins -y # we need to install fardaysec for marshmallow schemas, we remove plugins from pypi
+- cd ..
+
+.clone_reports: &clone_reports
+- git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/faradaysec/support/report-collection.git
+- cd report-collection
+- (git branch -a | grep $CI_COMMIT_BRANCH) && export REPORT_REF=$CI_COMMIT_BRANCH || export REPORT_REF=master
+- git checkout $REPORT_REF
+- cd ..
+
+bandit:
+  stage: SAST
+  image: python:3
+  tags: 
+    - faradaytests
+  script:
+    - pip3 install bandit
+    - mkdir /results
+    - "bandit -r ${CI_PROJECT_DIR} -o /results/output.xml -f xml --skip B410,B320,B310,B314,B404,B405,B324,B603,B104,B110,B112,B101"
+  after_script:
+    - curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add -
+    - apt update
+    - apt-get install software-properties-common -y
+    - apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com focal main"
+    - apt update
+    - apt install vault -y
+    - setcap cap_ipc_lock= /usr/bin/vault
+    - !reference [ .get_secrets, script ]
+    - pip3 install faraday-cli
+    - if [[ $(grep -c testcase /results/output.xml) -gt 0 ]]; then (faraday-cli auth -f $FARADAY_URL -u $FARADAY_USER -p $FARADAY_PASSWORD && faraday-cli tool report /results/output.xml -w $DEVSECOPS_WORKSPACE --tag-vuln $CI_PROJECT_NAME --tag-vuln $CI_COMMIT_REF_NAME); else (echo 'no vulns dettected' && exit 0); fi
+  rules:
+    - when: on_success
+
+flake8:
+    image: python:3
+    stage: pre_testing
+    before_script:
+      - pip install flake8
+      # Help flake8 to find the Python files without .py extension.
+      - find . -name '*.py' >> files.txt
+      - sort -u files.txt | tee files.processed
+    script:
+        - python -m flake8 --statistics --count $(cat files.processed) --verbose
+    after_script:
+        - wc -l files.processed
+
+.test_base:
+  stage: testing
+  coverage: '/TOTAL\s+\d+\s+\d+\s+(\d+%)/'
+  script:
+    - *clone_reports
+    - *install_faraday_venv
+    - pip3 install $PIP_FLAGS .
+    - pytest tests --capture=sys -v --cov=faraday_plugins --color=yes --disable-warnings $PYTEST_FLAGS
+
+tests:
+  extends: .test_base
+  image: python:3
+
+test_performance:
+  extends: .test_base
+  image: python:3
+  stage: post_testing
+  allow_failure: true
+  variables:
+    PYTEST_FLAGS: --performance
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+      when: on_success
+
+publish_pypi:
+    image: python:3
+    stage: publish
+    script:
+      - apt-get update -qy
+      - apt-get install twine -y
+      - python setup.py sdist bdist_wheel
+      - twine upload -u $PYPI_USER -p $PYPI_PASS dist/* --verbose
+    rules:
+      - if: '$CI_COMMIT_TAG'
+        when: on_success
+
